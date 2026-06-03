@@ -67,7 +67,7 @@ def build_argparser():
     p.add_argument("--grid", type=int, default=12, help="grid is (grid,grid)")
     p.add_argument("--target", type=int, default=None,
                    help="class index; default = model's top-1")
-    p.add_argument("--references", default="black,gray,mean,blur,inpaint",
+    p.add_argument("--references", default="black,white,mean,blur,inpaint",
                    help="comma-separated subset of the reference family used "
                         "as selection candidates AND measure baselines")
     p.add_argument("--seed", type=int, default=0)

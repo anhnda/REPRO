@@ -15,7 +15,7 @@ historical LIME implementation:
     unexplained variance (the §6 proxy) -- never by fitting higher-order terms.
 
 The reference operator rho is pluggable via a MaskLibrary, so the same code runs
-black / gray / mean / blur / inpaint references and supports the §6 selection
+black / white / mean / blur / inpaint references and supports the §6 selection
 criterion.
 
 Library use:
@@ -29,13 +29,18 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
 from _core import centered_design, lasso_fit  # shared, sklearn-backed
+
+# Standard ImageNet normalization stats (used to map pixel-space constants such
+# as white=1.0 into the normalized space the operators actually run in).
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
 
 # --------------------------------------------------------------------------- #
 #  Reference operators (rho).  Each maps (x, keep_mask) -> completed image.
@@ -52,12 +57,33 @@ def black_reference() -> ReferenceOp:
     return rho
 
 
-def gray_reference(value: float = 0.0) -> ReferenceOp:
-    # `value` in normalized space; 0.0 == dataset mean after standard ImageNet norm
+def constant_reference(pixel_value: float = 1.0,
+                       mean: Sequence[float] = IMAGENET_MEAN,
+                       std: Sequence[float] = IMAGENET_STD) -> ReferenceOp:
+    """Fill masked region with a constant PIXEL-space value (0..1), mapped into
+    normalized space per channel:  fill_c = (pixel_value - mean_c) / std_c.
+
+    pixel_value=1.0 -> white;  0.0 -> black-in-pixel-space (NOT the same as the
+    black_reference above, which fills normalized 0).  This is what makes
+    'white' a genuinely distinct operator from black: after ImageNet norm the
+    channel means are ~0, so a normalized-0 fill coincides with black, whereas a
+    pixel-space constant maps to a nonzero, per-channel-distinct value.
+    """
+    m = torch.tensor(mean, dtype=torch.float32).view(1, -1, 1, 1)
+    s = torch.tensor(std, dtype=torch.float32).view(1, -1, 1, 1)
+    fill_norm = (pixel_value - m) / s          # (1,C,1,1) in normalized space
+
     def rho(x, keep):
-        return keep * x + (1 - keep) * value
+        f = fill_norm.to(device=x.device, dtype=x.dtype)
+        return keep * x + (1 - keep) * f
     rho.is_stochastic = False  # type: ignore[attr-defined]
     return rho
+
+
+def white_reference(mean: Sequence[float] = IMAGENET_MEAN,
+                    std: Sequence[float] = IMAGENET_STD) -> ReferenceOp:
+    """White fill: pixel value 1.0 mapped through ImageNet normalization."""
+    return constant_reference(1.0, mean, std)
 
 
 def mean_reference() -> ReferenceOp:
@@ -105,7 +131,7 @@ def noisy_inpaint_reference(sigma_blur: float = 11.0, noise: float = 0.15) -> Re
 def default_reference_family() -> Dict[str, ReferenceOp]:
     return {
         "black": black_reference(),
-        "gray": gray_reference(0.0),
+        "white": white_reference(),
         "mean": mean_reference(),
         "blur": blur_reference(11.0),
         "inpaint": noisy_inpaint_reference(11.0, 0.15),
