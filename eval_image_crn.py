@@ -196,6 +196,18 @@ def _copeland_pick(names, G, Gc, Z):
     return winner, wins, contrasts
 
 
+def _linear_energy(Z, G, Gc):
+    """Dense linear energy s_rho = sum_i beta_hat_i^2 (split-sample beta_hat),
+    plus total response variance Var(g). SNR = s/m is the paper's recoverability
+    ratio; reporting it makes the selection table self-explaining."""
+    Q = Z.shape[0]
+    h = Q // 2
+    b = _estimate_beta(Z[:h], G[:h], Gc[:h])
+    s = float((b ** 2).sum())
+    var_g = float(np.var(G))
+    return s, var_g
+
+
 def _query_g(expl, x, rho, Z01, target, repeat):
     """Query the real masked response g_rho(z) = f_c(Phi_rho(x, z)) for a
     matrix of {0,1} cell masks Z01, reusing RefLIME's batched _query.
@@ -235,10 +247,20 @@ def select_reference_crn(expl, x, references, target, Q, seed, repeat):
 
     winner, wins, contrasts = _copeland_pick(names, G, Gc, Z)
     m_hat = {nm: _m_independent_resid(Z, G[nm], Gc[nm]) for nm in names}
+    s_hat, var_g, snr = {}, {}, {}
+    for nm in names:
+        s_hat[nm], var_g[nm] = _linear_energy(Z, G[nm], Gc[nm])
+        snr[nm] = s_hat[nm] / m_hat[nm] if m_hat[nm] > 0 else float("inf")
+    # ranking by wins, then by m_hat ascending as the tie-break
+    ranked = sorted(names, key=lambda nm: (-wins[nm], m_hat[nm]))
     return {
         "winner": winner,
         "wins": wins,
         "m_hat": m_hat,
+        "s_hat": s_hat,
+        "var_g": var_g,
+        "snr": snr,
+        "ranked": ranked,
         "contrasts": {f"{a}|{b}": v for (a, b), v in contrasts.items()},
         "Q": Q,
     }
@@ -313,6 +335,32 @@ def _agg(per_baseline, key, exclude=None):
             "n": len(vals)}
 
 
+def _spearman(a, b):
+    """Spearman rank correlation, ties averaged. Pure numpy. nan if degenerate."""
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    if a.size < 2:
+        return float("nan")
+
+    def rank(v):
+        order = np.argsort(v, kind="mergesort")
+        r = np.empty_like(order, dtype=float)
+        r[order] = np.arange(len(v), dtype=float)
+        _, inv, counts = np.unique(v, return_inverse=True, return_counts=True)
+        sums = np.zeros(len(counts))
+        np.add.at(sums, inv, r)
+        avg = sums / counts
+        return avg[inv]
+
+    ra, rb = rank(a), rank(b)
+    ra -= ra.mean()
+    rb -= rb.mean()
+    denom = np.sqrt((ra ** 2).sum() * (rb ** 2).sum())
+    if denom == 0:
+        return float("nan")
+    return float((ra * rb).sum() / denom)
+
+
 # =========================================================================== #
 #  Main
 # =========================================================================== #
@@ -374,10 +422,29 @@ def main():
                                repeat=args.select_repeat)
     best = sel["winner"]
 
-    print(f"\n{'reference':>10} {'wins':>6} {'m_hat(resid)':>14}")
-    for nm in references:
+    print(f"\n{'reference':>10} {'wins':>5} {'m_hat':>11} {'s_hat':>11} "
+          f"{'SNR(s/m)':>10} {'Var(g)':>11}")
+    print("-" * 62)
+    for nm in sel["ranked"]:
         flag = "  <== SELECTED" if nm == best else ""
-        print(f"{nm:>10} {sel['wins'][nm]:>6d} {sel['m_hat'][nm]:>14.6f}{flag}")
+        print(f"{nm:>10} {sel['wins'][nm]:>5d} {sel['m_hat'][nm]:>11.6f} "
+              f"{sel['s_hat'][nm]:>11.6f} {sel['snr'][nm]:>10.3f} "
+              f"{sel['var_g'][nm]:>11.6f}{flag}")
+
+    print(f"\n  pairwise contrasts  D_ab = mean(q_a - q_b)  (negative => a < b in m):")
+    for key, val in sel["contrasts"].items():
+        a, b = key.split("|")
+        leader = a if val < 0 else b
+        print(f"    {a:>8} vs {b:<8} : {val:+.3e}   -> lower m: {leader}")
+
+    # tie / fragility warning: flag near-equal m_hat among top contenders
+    ms = sorted(sel["m_hat"].values())
+    if len(ms) >= 2 and ms[0] > 0 and (ms[1] - ms[0]) / ms[0] < 0.02:
+        print("\n  [warning] top two references differ in m_hat by <2% -- the "
+              "tournament pick\n            between them is essentially a "
+              "coin flip at this Q. Raise --select-Q\n            or treat them "
+              "as tied.")
+
     print(f"\n>>> CRN-selected reference (lowest residual energy m): {best}")
 
     # optional: RefLIME SNR selection, comparison only
@@ -429,6 +496,11 @@ def main():
         }
         tag = "  <== SELECTED" if m_name == best else ""
         print(f"\n[method ref: {m_name}]{tag}")
+        print(f"  per measure baseline:")
+        for b_name, md in per_baseline.items():
+            self_tag = "  (self)" if b_name == m_name else ""
+            print(f"    {b_name:>8} : ins {md['insertion_auc']:.3f} | "
+                  f"del {md['deletion_auc']:.3f}{self_tag}")
         print(f"  all baselines        : "
               f"ins {agg_all['insertion_auc']['mean']:.3f}"
               f" +/- {agg_all['insertion_auc']['std']:.3f} | "
@@ -439,6 +511,63 @@ def main():
               f" +/- {agg_excl['insertion_auc']['std']:.3f} | "
               f"del {agg_excl['deletion_auc']['mean']:.3f}"
               f" +/- {agg_excl['deletion_auc']['std']:.3f}")
+
+    # ---- within-image agreement: selection signal (m_hat) vs faithfulness ----
+    # Mirrors eval_image.py's §8.2 descriptive check. Needs >=2 evaluated maps,
+    # so it only fires under --eval-all-maps. Conjecture: lower m -> higher
+    # insertion, lower deletion, i.e. m vs ins NEGATIVE, m vs del POSITIVE.
+    agreement = None
+    if len(maps_to_eval) >= 2:
+        ref_names = maps_to_eval
+        m_hat_v = np.array([sel["m_hat"][n] for n in ref_names])
+        snr_v = np.array([sel["snr"][n] for n in ref_names])
+        ins_v = np.array([eval_block[n]["agg_exclude_self"]["insertion_auc"]["mean"]
+                          for n in ref_names])
+        del_v = np.array([eval_block[n]["agg_exclude_self"]["deletion_auc"]["mean"]
+                          for n in ref_names])
+        n_ref = len(ref_names)
+        ins_rank = int(np.sum(ins_v > ins_v[ref_names.index(best)]) + 1)
+        del_rank = int(np.sum(del_v < del_v[ref_names.index(best)]) + 1)
+        ins_winner = ref_names[int(np.argmax(ins_v))]
+        del_winner = ref_names[int(np.argmin(del_v))]
+        spearman = {
+            "m_hat_vs_insertion": _spearman(m_hat_v, ins_v),   # expect < 0
+            "m_hat_vs_deletion": _spearman(m_hat_v, del_v),    # expect > 0
+            "snr_vs_insertion": _spearman(snr_v, ins_v),       # expect > 0
+            "snr_vs_deletion": _spearman(snr_v, del_v),        # expect < 0
+        }
+        agreement = {
+            "selected_reference": best,
+            "n_references": n_ref,
+            "selected_insertion_rank": ins_rank,
+            "selected_deletion_rank": del_rank,
+            "insertion_winner": ins_winner,
+            "deletion_winner": del_winner,
+            "selected_won_insertion": bool(ins_winner == best),
+            "selected_won_deletion": bool(del_winner == best),
+            "spearman_exclude_self": spearman,
+        }
+        print("\n" + "-" * 62)
+        print("within-image agreement (selection m_hat vs faithfulness)")
+        print(f"  selected ref: {best}")
+        print(f"  insertion: rank {ins_rank}/{n_ref} "
+              f"(winner: {ins_winner}{' == selected' if ins_winner == best else ''})")
+        print(f"  deletion : rank {del_rank}/{n_ref} "
+              f"(winner: {del_winner}{' == selected' if del_winner == best else ''})")
+        print(f"  Spearman rho (across {n_ref} refs, exclude-self AUCs):")
+        print(f"    m_hat vs insertion: {spearman['m_hat_vs_insertion']:+.3f}"
+              f"   (expects < 0)")
+        print(f"    m_hat vs deletion : {spearman['m_hat_vs_deletion']:+.3f}"
+              f"   (expects > 0)")
+        print(f"    SNR   vs insertion: {spearman['snr_vs_insertion']:+.3f}"
+              f"   (expects > 0)")
+        print(f"    SNR   vs deletion : {spearman['snr_vs_deletion']:+.3f}"
+              f"   (expects < 0)")
+        print("  note: few refs -> descriptive only; pool across images for inference")
+        print("-" * 62)
+    else:
+        print("\n[note] within-image agreement skipped (need >=2 evaluated maps; "
+              "pass --eval-all-maps).")
 
     # ---- headline: the CRN-selected explanation ----
     head_all = eval_block[best]["agg_all"]
@@ -467,6 +596,7 @@ def main():
         "references": list(references),
         "selection": sel,
         "eval": eval_block,
+        "agreement": agreement,
         "config": {
             "grid": args.grid, "select_Q": args.select_Q,
             "select_repeat": args.select_repeat,
