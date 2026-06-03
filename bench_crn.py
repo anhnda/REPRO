@@ -4,19 +4,21 @@ ins/del faithfulness, over a folder of images (default benchmark_50/*.JPEG).
 
 Why this exists
 ---------------
-A single image cannot test the §8.2 conjecture (lower residual energy m_rho ->
-more faithful explanation). Per-image Spearman over 5 references is pinned to
-coarse values (+1.0, -0.3, ...) and swings wildly image to image -- we have seen
-m_hat_vs_insertion go +1.0 on one image and -0.3 on the next, with the deletion
-axis carrying a -1.0 on the second. Inference lives in the DISTRIBUTION of these
-quantities across many images, not in any one.
+A single image cannot test whether low residual energy m_rho tracks ins/del
+faithfulness. NOTE this is an EXPLORATORY hypothesis of our own, NOT a claim in
+the RePro paper -- that paper ranks references by recoverable residual energy m
+and explicitly does not link m to a reference-free faithfulness ground truth.
+Per-image Spearman over 5 references is pinned to coarse values (+1.0, -0.3, ...)
+and swings wildly image to image -- we have seen m_hat_vs_insertion go +1.0 on
+one image and -0.3 on the next. If there is any signal, it lives in the
+DISTRIBUTION of these quantities across many images, not in any one.
 
 This runner reuses the EXACT per-image pipeline from eval_image_crn.py (imported,
 not reimplemented), runs it on every image, and aggregates with statistics that
 suit n > 5 images:
 
   * mean / std / 95% CI of each of the 4 Spearman correlations across images;
-  * a SIGN TEST on each correlation vs the conjecture's predicted sign
+  * a SIGN TEST on each correlation vs our hypothesized sign
     (fraction of images on the predicted side, with a binomial two-sided p);
   * the DISTRIBUTION of the CRN-selected reference's faithfulness rank
     (insertion and deletion) -- the most noise-robust signal, since it does not
@@ -229,7 +231,8 @@ def _summ(vals):
     }
 
 
-# conjecture's predicted sign for each correlation: True means "expect < 0"
+# our hypothesized sign for each correlation: True means "we'd expect < 0"
+# (exploratory; NOT a sign the RePro paper predicts)
 _EXPECT_NEG = {
     "m_hat_vs_insertion": True,
     "m_hat_vs_deletion": False,
@@ -251,7 +254,7 @@ def aggregate(results):
         n_eff = len(clean)
         on_side = sum((v < 0) == expect_neg for v in clean)
         s["sign_test"] = {
-            "predicted_sign": "negative" if expect_neg else "positive",
+            "hypothesized_sign": "negative" if expect_neg else "positive",
             "n_nonzero": n_eff,
             "n_on_predicted_side": on_side,
             "frac_on_predicted_side": (on_side / n_eff) if n_eff else float("nan"),
@@ -332,9 +335,11 @@ def print_summary(agg):
           f"{agg['selected_won_insertion_frac']:.0%} of images; "
           f"won deletion on {agg['selected_won_deletion_frac']:.0%}")
 
-    print("\n§8.2 conjecture test -- Spearman across refs, pooled over images:")
+    print("\nEXPLORATORY: m vs ins/del faithfulness -- Spearman across refs, "
+          "pooled over images")
+    print("  (our own hypothesis; the RePro paper makes NO such claim)")
     print(f"  {'correlation':>20} {'mean':>8} {'95% CI':>18} "
-          f"{'pred':>5} {'on-side':>9} {'binom p':>9}")
+          f"{'hyp':>5} {'on-side':>9} {'binom p':>9}")
     for k, s in agg["spearman_summary"].items():
         if s.get("n", 0) == 0:
             continue
@@ -346,12 +351,14 @@ def print_summary(agg):
               f"{st['binom_p_two_sided']:>9.3f}")
 
     print("\ninterpretation guide:")
-    print("  * If the conjecture holds, each correlation's mean should sit on")
-    print("    its predicted side with sign-test p < 0.05.")
+    print("  * REMINDER: the m<->faithfulness link is OUR hypothesis, not a")
+    print("    RePro claim. The paper only asserts robust ranking by m.")
+    print("  * If our hypothesis held, each correlation's mean would sit on its")
+    print("    hypothesized side with sign-test p < 0.05.")
     print("  * The faithfulness-rank histogram is the headline: if the")
     print("    CRN-selected (lowest-m) reference is reliably mid/bottom rank,")
-    print("    then low-m selection does NOT buy faithfulness on this model --")
-    print("    a real negative result for the §8.2 conjecture on real images.")
+    print("    then low-m selection does NOT buy ins/del faithfulness on this")
+    print("    model -- a finding about real reference families, beyond the paper.")
     print("  * Spearman-over-5-points is coarse; trust the pooled sign test and")
     print("    the rank histogram over any single image's correlation.")
     print("=" * 70)

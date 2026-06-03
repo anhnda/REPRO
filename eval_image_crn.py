@@ -8,10 +8,10 @@ wired in front of the existing eval_image.py faithfulness pipeline.
 
 What changes vs eval_image.py
 -----------------------------
-eval_image.py selected `best_reference` via RefLIME's §6 SNR criterion (gamma),
+eval_image.py selected `best_reference` via RefLIME's SNR criterion (gamma),
 which requires fitting a surrogate per reference -- the post-hoc, floored route
-the paper argues against. Here we REPLACE that with the paper's cheap,
-pre-explanation selector:
+the RePro paper argues against (its Remark 1 variance floor). Here we REPLACE
+that with the paper's cheap, pre-explanation selector:
 
   * draw a single batch of shared masks z ~ mu (Bernoulli-1/2, the RefLIME
     MaskLibrary distribution) plus complements z' = 1 - z;
@@ -512,10 +512,16 @@ def main():
               f"del {agg_excl['deletion_auc']['mean']:.3f}"
               f" +/- {agg_excl['deletion_auc']['std']:.3f}")
 
-    # ---- within-image agreement: selection signal (m_hat) vs faithfulness ----
-    # Mirrors eval_image.py's §8.2 descriptive check. Needs >=2 evaluated maps,
-    # so it only fires under --eval-all-maps. Conjecture: lower m -> higher
-    # insertion, lower deletion, i.e. m vs ins NEGATIVE, m vs del POSITIVE.
+    # ---- EXPLORATORY: does the selection signal (m_hat) track ins/del? ------
+    # NOTE: this is NOT a claim from the RePro paper. The paper ranks references
+    # by recoverable residual energy m and explicitly does NOT certify a
+    # reference-free ground truth or link m to insertion/deletion faithfulness.
+    # The correlations below test a *separate* hypothesis of our own: that a
+    # lower-m (more recoverable) reference might also yield a more faithful
+    # attribution. If that held, we would expect m vs insertion NEGATIVE and
+    # m vs deletion POSITIVE -- but these are OUR hypothesized directions, used
+    # only as a reading aid, not predictions the paper makes. Needs >=2
+    # evaluated maps, so it only fires under --eval-all-maps.
     agreement = None
     if len(maps_to_eval) >= 2:
         ref_names = maps_to_eval
@@ -531,10 +537,10 @@ def main():
         ins_winner = ref_names[int(np.argmax(ins_v))]
         del_winner = ref_names[int(np.argmin(del_v))]
         spearman = {
-            "m_hat_vs_insertion": _spearman(m_hat_v, ins_v),   # expect < 0
-            "m_hat_vs_deletion": _spearman(m_hat_v, del_v),    # expect > 0
-            "snr_vs_insertion": _spearman(snr_v, ins_v),       # expect > 0
-            "snr_vs_deletion": _spearman(snr_v, del_v),        # expect < 0
+            "m_hat_vs_insertion": _spearman(m_hat_v, ins_v),   # hyp. < 0
+            "m_hat_vs_deletion": _spearman(m_hat_v, del_v),    # hyp. > 0
+            "snr_vs_insertion": _spearman(snr_v, ins_v),       # hyp. > 0
+            "snr_vs_deletion": _spearman(snr_v, del_v),        # hyp. < 0
         }
         agreement = {
             "selected_reference": best,
@@ -546,9 +552,11 @@ def main():
             "selected_won_insertion": bool(ins_winner == best),
             "selected_won_deletion": bool(del_winner == best),
             "spearman_exclude_self": spearman,
+            "note": "exploratory; not a RePro paper claim",
         }
         print("\n" + "-" * 62)
-        print("within-image agreement (selection m_hat vs faithfulness)")
+        print("EXPLORATORY: selection m_hat vs ins/del faithfulness")
+        print("  (our own hypothesis, NOT a RePro paper claim)")
         print(f"  selected ref: {best}")
         print(f"  insertion: rank {ins_rank}/{n_ref} "
               f"(winner: {ins_winner}{' == selected' if ins_winner == best else ''})")
@@ -556,18 +564,18 @@ def main():
               f"(winner: {del_winner}{' == selected' if del_winner == best else ''})")
         print(f"  Spearman rho (across {n_ref} refs, exclude-self AUCs):")
         print(f"    m_hat vs insertion: {spearman['m_hat_vs_insertion']:+.3f}"
-              f"   (expects < 0)")
+              f"   (our hyp: < 0)")
         print(f"    m_hat vs deletion : {spearman['m_hat_vs_deletion']:+.3f}"
-              f"   (expects > 0)")
+              f"   (our hyp: > 0)")
         print(f"    SNR   vs insertion: {spearman['snr_vs_insertion']:+.3f}"
-              f"   (expects > 0)")
+              f"   (our hyp: > 0)")
         print(f"    SNR   vs deletion : {spearman['snr_vs_deletion']:+.3f}"
-              f"   (expects < 0)")
+              f"   (our hyp: < 0)")
         print("  note: few refs -> descriptive only; pool across images for inference")
         print("-" * 62)
     else:
-        print("\n[note] within-image agreement skipped (need >=2 evaluated maps; "
-              "pass --eval-all-maps).")
+        print("\n[note] exploratory ins/del-vs-m check skipped (need >=2 "
+              "evaluated maps; pass --eval-all-maps).")
 
     # ---- headline: the CRN-selected explanation ----
     head_all = eval_block[best]["agg_all"]
