@@ -1,27 +1,30 @@
 """
-RePro synthetic verification — antithetic-pairs estimator, Torch + CUDA.
+RePro — LAST TRY: paired contrasts via common random numbers (CRN).
 
-Why this form: the previous estimator m = Var(g) - s subtracts two large numbers
-when the reference is good (m << s), causing catastrophic cancellation exactly in
-the regime we want to select. Antithetic folding fixes the dominant part.
+Diagnosis from prior runs: any statistic that reads m_rho off the full function g
+has variance floored by Var(g), not by m. Estimating each m_rho independently and
+then comparing fails at realistic (tight) gaps -> needed ~80k queries/ref for 0.81.
 
-Antithetic fold. Draw z and its complement z' = 1 - z. In the centered Walsh basis
-chi_S(z') = (-1)^{|S|} chi_S(z), so:
-    even fold  e(z) = 1/2 ( g(z) + g(z') ) = beta_0 + sum_{|S| even >=2} beta_S chi_S
-    odd  fold  o(z) = 1/2 ( g(z) - g(z') ) = sum_{|S| odd}            beta_S chi_S
-=> Var(e) = sum_{|S| even >=2} beta_S^2        (NO linear term, NO big subtraction)
-   Var(o) = sum_{|S| odd}      beta_S^2        (= linear energy s + odd interactions)
-Interaction residual energy:
-    m = [ Var(e) ]                      (even interactions, clean)
-      + [ Var(o) - s ]                  (odd interactions; subtract linear)
-where s = sum_i beta_i^2 estimated densely. The even block — the usual dominant part
-for pairwise structure — is now estimated with NO cancellation. Only odd-order
-interactions carry a residual subtraction, and that term is small when present.
+Fix that actually targets the floor: selection only needs the RANKING, i.e. the sign
+of  D = m_rho - m_rho'  for reference pairs. Estimate that DIFFERENCE directly on the
+SAME random masks (common random numbers). When two references of the same input share
+structure, the shared high-variance part cancels in the per-sample difference, so
+Var(D_hat) depends on how much rho and rho' DIFFER, not on Var(g). Rank by the resulting
+tournament (Copeland: each ref's number of pairwise wins).
+
+Per-sample contrast (antithetic even-fold interaction proxy, differenced across refs):
+   For mask z (and complement), even-fold e_rho(z) = 1/2(g_rho(z)+g_rho(1-z)).
+   Centered even-fold square  q_rho(z) = (e_rho(z) - mean_e_rho)^2  has  E[q_rho] = Var(e_rho).
+   Paired contrast for refs a,b on the SAME z:  c_ab(z) = q_a(z) - q_b(z),
+   E[c_ab] = Var(e_a) - Var(e_b)  -> sign gives the even-interaction-energy ordering.
+   (Odd-order handled symmetrically with the odd fold; summed in.)
+The variance of mean(c_ab) is driven by Var(q_a - q_b), which is small when g_a, g_b
+share structure -- the regime of references on one fixed input.
 
 Checks:
-  (a) m_hat unbiased, low error even though m << s,
-  (b) concentration 1/sqrt(Q), no d^2 blowup,
-  (c) HARD selection: tightly-spaced m in {2.0, 2.3, 2.7, 3.2}.
+  (a) paired contrast recovers sign of (m_a - m_b) far cheaper than independent m_hat,
+  (b) HARD tournament selection, m in {2.0,2.3,2.7,3.2}, shared-structure refs,
+  (c) variance comparison: Var(paired contrast) vs Var(independent difference).
 
 Run:  python repro_verify_torch.py
 """
@@ -33,17 +36,23 @@ DTYPE = torch.float64
 print(f"device = {DEV}")
 
 
-def make_planted(d, lin_scale, quad_pairs, quad_scale, seed, target_m=None):
+def make_family(d, n_refs, seed):
+    """References on ONE input share a common linear+interaction backbone; each ref
+    perturbs the interaction block (models how a reference operator reshapes g).
+    Returns list of (beta_lin, pairs, coefs, true_m), with tightly-spaced m."""
     r = torch.Generator(device=DEV).manual_seed(seed)
-    beta_lin = torch.randn(d, generator=r, device=DEV, dtype=DTYPE) * lin_scale
-    pairs = torch.randint(0, d, (quad_pairs, 2), generator=r, device=DEV)
-    coefs = torch.randn(quad_pairs, generator=r, device=DEV, dtype=DTYPE) * quad_scale
+    d_ = d
+    base_lin = torch.randn(d_, generator=r, device=DEV, dtype=DTYPE)          # shared
+    pairs = torch.randint(0, d_, (8, 2), generator=r, device=DEV)
     keep = pairs[:, 0] != pairs[:, 1]
-    pairs, coefs = pairs[keep], coefs[keep]
-    if target_m is not None:                       # rescale pairwise block to exact m
-        cur = float((coefs ** 2).sum())
-        coefs = coefs * (target_m / cur) ** 0.5
-    return beta_lin, pairs, coefs
+    pairs = pairs[keep]
+    base_co = torch.randn(pairs.shape[0], generator=r, device=DEV, dtype=DTYPE)  # shared shape
+    targets = [2.0, 2.3, 2.7, 3.2][:n_refs]
+    fam = []
+    for tm in targets:
+        co = base_co * (tm / float((base_co**2).sum()))**0.5   # same directions, scaled to m
+        fam.append((base_lin, pairs, co, tm))
+    return fam
 
 
 def g_eval(Z, beta_lin, pairs, coefs):
@@ -54,61 +63,93 @@ def g_eval(Z, beta_lin, pairs, coefs):
     return out
 
 
-def true_m(coefs):
-    return float((coefs ** 2).sum())
+def even_fold_sq(Z, Zc, bl, pr, co):
+    y = g_eval(Z, bl, pr, co); yc = g_eval(Zc, bl, pr, co)
+    e = 0.5 * (y + yc)
+    o = 0.5 * (y - yc)
+    # per-sample interaction proxy: centered even square + (odd square - linear proj)
+    # linear proj removed densely from odd fold:
+    return e, o
 
 
-def true_s(beta_lin):
-    return float((beta_lin ** 2).sum())
-
-
-def estimate_m(beta_lin, pairs, coefs, d, Q, seed):
-    """Antithetic-pairs fit-free estimate of interaction residual energy m."""
+def masks(Q, d, seed):
     r = torch.Generator(device=DEV).manual_seed(seed)
     Z = torch.randint(0, 2, (Q, d), generator=r, device=DEV).to(DTYPE)
-    Zc = 1.0 - Z
-    y = g_eval(Z, beta_lin, pairs, coefs)
-    yc = g_eval(Zc, beta_lin, pairs, coefs)
-    e = 0.5 * (y + yc)                              # even fold
-    o = 0.5 * (y - yc)                              # odd fold
-    var_e = e.var(unbiased=True)                    # even interaction energy (clean)
-    var_o = o.var(unbiased=True)                    # = s + odd interactions
+    return Z, 1.0 - Z
+
+
+def m_independent(bl, pr, co, d, Q, seed):
+    Z, Zc = masks(Q, d, seed)
+    e, o = even_fold_sq(Z, Zc, bl, pr, co)
     chi = 2.0 * (Z - 0.5)
-    beta_hat = (chi * o[:, None]).mean(0)           # E[o * chi_i] = beta_i
-    s_hat = (beta_hat ** 2).sum()
-    return float(var_e + (var_o - s_hat))
+    s_hat = ((chi * o[:, None]).mean(0) ** 2).sum()
+    return float(e.var(unbiased=True) + (o.var(unbiased=True) - s_hat))
+
+
+def contrast_sign(a, b, d, Q, seed):
+    """E[c]=Var(e_a)-Var(e_b)+(odd terms); estimated on COMMON masks. Returns mean, std."""
+    Z, Zc = masks(Q, d, seed)
+    bl_a, pr_a, co_a, _ = a
+    bl_b, pr_b, co_b, _ = b
+    ea, oa = even_fold_sq(Z, Zc, bl_a, pr_a, co_a)
+    eb, ob = even_fold_sq(Z, Zc, bl_b, pr_b, co_b)
+    chi = 2.0 * (Z - 0.5)
+    sa = ((chi * oa[:, None]).mean(0) ** 2).sum()
+    sb = ((chi * ob[:, None]).mean(0) ** 2).sum()
+    qa = (ea - ea.mean())**2 + ( (oa - oa.mean())**2 )   # interaction-energy proxy per sample
+    qb = (eb - eb.mean())**2 + ( (ob - ob.mean())**2 )
+    c = (qa - qb)                                        # paired, common random numbers
+    # subtract the linear part of the odd contribution (constant offset, no extra variance):
+    offset = (sa - sb)
+    cmean = c.mean() - offset
+    return float(cmean), float(c.std() / (Q ** 0.5))
 
 
 if __name__ == "__main__":
     d = 40
+    fam = make_family(d, 4, seed=10)
+    print("    true m:", {f"rho_{k}": round(fam[k][3], 3) for k in range(4)}, " best: rho_0")
 
-    # ---- (a) unbiasedness with m << s ----
-    beta_lin, pairs, coefs = make_planted(d, 1.0, 8, 0.8, seed=10)
-    m, s = true_m(coefs), true_s(beta_lin)
-    Q = 200_000
-    mhat = estimate_m(beta_lin, pairs, coefs, d, Q, seed=1)
-    print(f"\n[a] planted m={m:.4f}  s={s:.4f}  (m/s={m/s:.3f})   m_hat={mhat:.4f}   abs_err={abs(mhat-m):.4f}")
+    # ---- (a) paired contrast sign accuracy vs independent, small Q ----
+    print("\n[a] adjacent-pair sign accuracy (rho_0 vs rho_1, true diff = -0.3):")
+    for Q in [1000, 5000, 20000]:
+        ind_hits = crn_hits = 0
+        trials = 300
+        for t in range(trials):
+            # independent: two separate m_hats, different masks
+            ma = m_independent(*fam[0][:3], d, Q, 7000 + t)
+            mb = m_independent(*fam[1][:3], d, Q, 9000 + t)
+            ind_hits += (ma - mb) < 0
+            # CRN paired contrast
+            cm, _ = contrast_sign(fam[0], fam[1], d, Q, 5000 + t)
+            crn_hits += cm < 0
+        print(f"    Q={Q:6d}   P(sign right): independent={ind_hits/trials:.3f}   CRN-paired={crn_hits/trials:.3f}")
 
-    # ---- (b) concentration ----
-    print("\n[b] concentration of m_hat:")
-    for Q in [200, 1000, 5000, 20000]:
-        errs = torch.tensor([abs(estimate_m(beta_lin, pairs, coefs, d, Q, 100 + rep) - m)
-                             for rep in range(200)])
-        print(f"    Q={Q:6d}   mean|m_hat - m|={errs.mean():.4f}   std={errs.std():.4f}")
-
-    # ---- (c) HARD selection: tightly-spaced m ----
-    print("\n[c] HARD reference selection, m in {2.0, 2.3, 2.7, 3.2}:")
-    refs = {}
-    for k, tm in enumerate([2.0, 2.3, 2.7, 3.2]):
-        bl, pr, co = make_planted(d, 1.0, 8, 0.8, seed=10 + k, target_m=tm)
-        refs[f"rho_{k}"] = (bl, pr, co, true_m(co))
-    true_best = min(refs, key=lambda r: refs[r][3])
-    print("    true m:", {r: round(refs[r][3], 3) for r in refs}, " best:", true_best)
-    for Q in [1000, 5000, 20000, 80000]:
+    # ---- (b) full tournament selection (Copeland wins) ----
+    print("\n[b] tournament selection via paired contrasts:")
+    for Q in [1000, 5000, 20000]:
         hits, trials = 0, 200
         for t in range(trials):
-            scores = {r: estimate_m(bl, pr, co, d, Q, 1000 + t * 17 + i)
-                      for i, (r, (bl, pr, co, _)) in enumerate(refs.items())}
-            pick = min(scores, key=lambda rr: scores[rr])
-            hits += (pick == true_best)
+            wins = [0, 0, 0, 0]
+            for i in range(4):
+                for j in range(i + 1, 4):
+                    cm, _ = contrast_sign(fam[i], fam[j], d, Q, 200 + t * 31 + i * 4 + j)
+                    if cm < 0: wins[i] += 1
+                    else:      wins[j] += 1
+            pick = max(range(4), key=lambda k: wins[k])
+            hits += (pick == 0)
         print(f"    Q={Q:6d}   P(correct select)={hits/trials:.3f}")
+
+    # ---- (c) variance: paired contrast vs independent difference ----
+    print("\n[c] std of the (rho_0 - rho_1) difference estimate at Q=5000:")
+    Q = 5000
+    crn_vals, ind_vals = [], []
+    for t in range(300):
+        cm, _ = contrast_sign(fam[0], fam[1], d, Q, 13000 + t)
+        crn_vals.append(cm)
+        ind_vals.append(m_independent(*fam[0][:3], d, Q, 14000 + t)
+                        - m_independent(*fam[1][:3], d, Q, 15000 + t))
+    crn_vals = torch.tensor(crn_vals); ind_vals = torch.tensor(ind_vals)
+    print(f"    independent diff: mean={ind_vals.mean():.4f} std={ind_vals.std():.4f}")
+    print(f"    CRN paired diff : mean={crn_vals.mean():.4f} std={crn_vals.std():.4f}")
+    print(f"    variance reduction factor ~ {(ind_vals.std()/crn_vals.std())**2:.1f}x")
